@@ -1,0 +1,246 @@
+---
+title: "HW3-Technical Document"
+author: "Xinbo Wang, Mark Chen, Farhad Mughal, Weizhong Yao"
+date: "2020/11/05"
+output: pdf_document
+---
+
+## Introduction
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+This document describes our approach to help XYZ develop a strategy for promotional campaign targeting, by predicting the possible adopters based on their known information. 
+
+
+```{r library}
+library(class)
+library(dplyr)
+library(caret)
+library(e1071)
+library(rpart)
+library(ROCR)
+library(kknn)
+library(ggplot2)
+library(ggthemr)
+ggthemr('dust')
+
+# switch path to the current context.
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+```
+
+The data used in this task consists of 41,540 user records from past campaigns. The data describes the users' demographic and especially behavior information on the platform, including perspectives like friends, songs listened, posts, etc. There are in total of 25 different attributes plus a label for the outcome (adopter) for each user. 
+
+```{r load data}
+data <- read.csv('XYZData.csv')
+head(data)
+```
+
+The overall adopter rate in this dataset is `r format(table(data$adopter)[2] / nrow(data)*100, digits=2)`%. We assume that the dataset represents the population of all free users and try to use the 25 attributes as features to predict adopters in our free users for future campaigns.
+
+## Preparation
+
+To facilitate the following model and feature selection procedure, we run an initial feature filtering to rule out the features that contain little useful information by looking at their correlation with the label.
+
+```{r filter features}
+correlation <- cor(data[,2:26],data[,27])
+
+high_corr <- subset(correlation, abs(correlation)>0.05)
+data <- data %>% select(c(row.names(high_corr)),'adopter')
+head(data)
+```
+`r length(high_corr)` features will be further selected later together with models.
+
+```{r normalization & testing split}
+normalize <- function(x){
+  return ((x - min(x))/(max(x) - min(x)))}
+
+data_normalized <- data %>% mutate(across(-adopter, normalize))
+data_normalized <- data_normalized %>% mutate(adopter = factor(adopter))
+
+test_rows <- createDataPartition(y = data_normalized$adopter, p = 0.20, list = FALSE)
+data_test <- data_normalized[test_rows,]
+data_train_validation <- data_normalized[-test_rows,]
+```
+
+After normalization, we reserved 20% of the dataset as test set and will use that to evaluate the performance of our final model. The rest of the 80% dataset will be used in the model selection and training procedure.
+
+## Model Selection
+
+To run construct the loops for selection, we first define the functions to predict and evaluate the models using our own metrics
+
+```{r functions}
+# The function pred will produce the probability prediction of adopter=1, accepting a parameter
+# to specify the model
+pred <- function(model_name, trainset, validationset){
+  if (model_name == 'knn5'){
+    model = kknn(adopter ~ ., trainset, validationset, 
+                 k=5, distance=2, kernel='rectangular')
+    prob = model$prob[,2]
+  }
+  else if (model_name == 'knn6'){
+    model = kknn(adopter ~ ., trainset, validationset, 
+                 k=6, distance=2, kernel='rectangular')
+    prob = model$prob[,2]
+  }
+  else if (model_name == 'knn7'){
+    model = kknn(adopter ~ ., trainset, validationset, 
+                 k=7, distance=2, kernel='rectangular')
+    prob = model$prob[,2]
+  }
+  
+  else if (model_name == 'NaiveBayse'){
+    NB_model = naiveBayes(adopter ~ ., data = trainset)
+    prob = predict(NB_model, validationset, type = "raw")[,2]
+  }
+  
+  else if (model_name == 'DecisionTree'){
+    tree = rpart(adopter ~ ., data = trainset,
+                          method = "class",
+                          parms = list(split = "information"))
+    prob = predict(tree, validationset)[,2]
+  }
+  
+  else if (model_name == 'LogisticRregression'){
+    mdl <- glm(formula = adopter~.,
+			family = binomial(link = "logit"), 
+			data = trainset)
+    prob <- predict(mdl, validationset, type = "response")
+  }
+
+  return(prob)
+}
+
+# The function cut_cost accepts the predicted probability and actual labels and calculate
+# the optimal cut-off point and minimum cost based on our definition 
+cut_cost <- function(pred_prob, label){
+  # https://stackoverflow.com/questions/16347507/obtaining-threshold-values-from-a-roc-curve
+  perf = performance(prediction(pred_prob, labels), 'cost', 
+                     cost.fp=1.14, cost.fn=34.36-1.14)
+  # We assume that the cost of a false positive (adopter predicted as non-adopter is 34.36,
+  # the cost of a false negative (non-adopter predicted as adopter is 1.14.
+  # This is explained in the managerial document.
+  cutoffs <- data.frame(cut=perf@x.values[[1]], cost=perf@y.values[[1]])
+  cost <- min(cutoffs$cost)
+  cut <- cutoffs[which.min(cutoffs$cost),'cut']
+
+  return(c(cut, cost))
+}
+```
+
+Then is our main loop for model selection. We incorporate feature selection process in our model selection. This can be interpreted that models are the combinations of algorithms and feature selections. 
+
+Our strategy is to first find the best feature selection for each algorithm, and then compare the best results of each algorithm to determine the best model.
+
+To evaluate the performance of models, we adopt 5-folds cross validation and take the cumulated predictions to find the cut-off point and minimum cost.
+
+Six models are considered here: three KNN models with k equal to 5, 6, 7, Naive Bayse, Decision Tree, and Logistic Regression. Due to computational constraint, we are only tuning the parameter k for KNN models.
+
+```{r model & feature selection}
+cv = createFolds(y = data_train_validation$adopter, k = 5)
+
+final_feature <- list()
+final_cost <- c()
+final_cut <- c()
+models = c('knn5','knn6','knn7','NaiveBayse','DecisionTree','LogisticRregression')
+
+starttime =Sys.time()
+for (model in models) {
+  pred_probs <- c()
+  labels <- c()
+  # Initialize by calculating the cost with all features
+  for (validation_rows in cv) {
+    data_train = data_train_validation[-validation_rows,]
+    data_validation = data_train_validation[validation_rows,]
+    probs <- pred(model, data_train, data_validation)
+    labels <- c(labels, factor(data_validation$adopter))
+    pred_probs <- c(pred_probs, probs)
+  }
+  optimal <- cut_cost(pred_probs, labels)
+  bestcut <- c(final_cut, optimal[1])
+  bestcost <- c(final_cost, optimal[2])
+  
+  # Backward eliminate the undesirable features
+  selected_features = 1:(ncol(data_train_validation)-1)
+  while (TRUE) {
+    feature_to_drop = -1
+    for (i in selected_features) {
+      pred_probs <- c()
+      labels <- c()
+      for (validation_rows in cv) {
+        data_train = data_train_validation[-validation_rows,] %>%
+          select(setdiff(selected_features,i), adopter)
+        data_validation = data_train_validation[validation_rows,] %>%
+          select(setdiff(selected_features,i), adopter)
+        res <- pred(model, data_train, data_validation)
+        labels <- c(labels, factor(data_validation$adopter))
+        pred_probs <- c(pred_probs, res)
+      }
+      optimal <- cut_cost(pred_probs, labels)
+      if (bestcost > optimal[2]) {
+        bestcost = optimal[2]
+        bestcut = optimal[1]
+        feature_to_drop = i
+      }
+    }
+    if (feature_to_drop != -1) {
+      selected_features = setdiff(selected_features, feature_to_drop)
+    }
+    else break
+  }
+  # record the best selection, cost, and cut-off for each model
+  final_feature[[model]] <- selected_features
+  final_cost[model] <- bestcost
+  final_cut[model] <- bestcut
+}
+endtime =Sys.time()
+```
+
+The above model and feature selection loop ran `r format(as.numeric(difftime(endtime, starttime, units='mins')), digits=2)` minutes.
+
+```{r comparing}
+# Baseline is the strategy to target all free users
+base <- cut_cost(integer(length(labels)) + 1, labels)
+final_cost['Baseline Cost'] <- base[2]
+
+cost_df <- data.frame(names(final_cost), final_cost)
+max_profit <- (34.36-1.14)*table(data_train_validation$adopter)[2]/
+  nrow(data_train_validation)
+ggplot(cost_df, aes(x=names.final_cost.,y=final_cost)) + 
+  geom_col() +
+  geom_hline(yintercept=max_profit, color='black', size=1) + 
+  geom_hline(yintercept=base[2], linetype='dashed',size=1) +
+  annotate('text',7,1.3,label='Expected Return') + 
+  annotate('text',7,1.05,label='Baseline Cost') +
+  xlab('') + ylab('Cost Per User')
+```
+
+As shown, `r names(final_cost)[which.min(final_cost)]` generates the lowest cost. It is optimized with a cut-off of `r final_cut[which.min(final_cost)]` and features listed below:
+
+`r colnames(data_train_validation)[unlist(final_feature[which.min(final_cost)])]`
+
+## Model Evaluation
+Now we will use these features and cut-off to train our `r names(final_cost)[which.min(final_cost)]` model and evaluate its performance on the test set.
+
+```{r training & evaluating}
+model <- names(final_cost)[which.min(final_cost)]
+cutoff <- final_cut[model]
+features <- unlist(final_feature[model])
+
+labels <- data_test$adopter
+test <- data_test %>% select(features, adopter)
+# We will be training on the rest of the dataset as a whole
+train_validation <- data_train_validation %>% select(features, adopter)
+
+probs <- pred(model, train_validation, test)
+predic <- as.numeric(probs >= cutoff)
+
+cm <- confusionMatrix(factor(predic), factor(labels), positive='1')
+cm
+```
+
+Our model can bring us on average of \$`r format(max_profit - cut_cost(predic, labels)[2], digits=2)` profit for each free user we have in the next campaign, compared to the baseline \$`r format(max_profit - base[2], digits=2)` if we target all users, which is a `r format((max_profit - cut_cost(predic, labels)[2]) / (max_profit - base[2])*100, digits=4)`% increase.
+
+In other words, if we have 1000,000 free users, we will earn \$`r format(1000000*(base[2]-cut_cost(predic, labels)[2]), digits=7)` more by only targeting the top `r format((cm$table[2,1] + cm$table[2,2])/sum(cm$table)*100, digits=3)`% potential adopters predicted by our model.
+
+
